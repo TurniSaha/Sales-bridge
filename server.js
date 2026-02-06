@@ -5,6 +5,7 @@ const Database = require('better-sqlite3');
 const cron = require('node-cron');
 const pino = require('pino');
 const path = require('path');
+const fs = require('fs');
 
 const app = express();
 app.use(express.json());
@@ -19,6 +20,29 @@ const MAX_ATTEMPTS = 3;
 const log = pino({ level: 'info' });
 
 // ---------------------------------------------------------------------------
+// Campaign routing config (pain_profile -> campaign_id)
+// ---------------------------------------------------------------------------
+let campaignRouting = null;
+if (process.env.CAMPAIGN_ROUTING) {
+  try {
+    campaignRouting = JSON.parse(process.env.CAMPAIGN_ROUTING);
+    log.info({ profiles: Object.keys(campaignRouting) }, 'Campaign routing loaded from env');
+  } catch (err) {
+    log.error({ error: err.message }, 'Failed to parse CAMPAIGN_ROUTING env var');
+  }
+} else {
+  const routingFilePath = path.join(__dirname, 'campaign_routing.json');
+  if (fs.existsSync(routingFilePath)) {
+    try {
+      campaignRouting = JSON.parse(fs.readFileSync(routingFilePath, 'utf8'));
+      log.info({ profiles: Object.keys(campaignRouting) }, 'Campaign routing loaded from file');
+    } catch (err) {
+      log.error({ error: err.message }, 'Failed to parse campaign_routing.json');
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Mailshake auth header (Basic Auth)
 // ---------------------------------------------------------------------------
 const MAILSHAKE_AUTH = `Basic ${Buffer.from(MAILSHAKE_API_KEY + ':').toString('base64')}`;
@@ -27,7 +51,6 @@ const MAILSHAKE_AUTH = `Basic ${Buffer.from(MAILSHAKE_API_KEY + ':').toString('b
 // Database setup
 // ---------------------------------------------------------------------------
 const dbPath = process.env.DB_PATH || path.join(__dirname, 'prospects.db');
-const fs = require('fs');
 fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
@@ -51,13 +74,55 @@ db.exec(`
   )
 `);
 
+// Migrate: add campaign_id column if it doesn't exist yet
+try {
+  db.exec(`ALTER TABLE prospects ADD COLUMN campaign_id INTEGER`);
+  log.info('Added campaign_id column to prospects table');
+} catch (err) {
+  // Column already exists -- safe to ignore
+}
+
+// ---------------------------------------------------------------------------
+// Routing table (email -> pain_profile for campaign selection)
+// ---------------------------------------------------------------------------
+db.exec(`
+  CREATE TABLE IF NOT EXISTS routing (
+    email TEXT PRIMARY KEY,
+    pain_profile TEXT NOT NULL,
+    first_name TEXT,
+    last_name TEXT,
+    company TEXT
+  )
+`);
+
+const lookupRouting = db.prepare(`
+  SELECT pain_profile FROM routing WHERE email = ?
+`);
+
+const upsertRouting = db.prepare(`
+  INSERT INTO routing (email, pain_profile, first_name, last_name, company)
+  VALUES (@email, @pain_profile, @first_name, @last_name, @company)
+  ON CONFLICT(email) DO UPDATE SET
+    pain_profile = excluded.pain_profile,
+    first_name = excluded.first_name,
+    last_name = excluded.last_name,
+    company = excluded.company
+`);
+
+const routingStats = db.prepare(`
+  SELECT pain_profile, COUNT(*) as count FROM routing GROUP BY pain_profile
+`);
+
+// ---------------------------------------------------------------------------
+// Prepared statements
+// ---------------------------------------------------------------------------
 const insertProspect = db.prepare(`
   INSERT INTO prospects (first_name, last_name, email, linkedin_url,
                          heyreach_campaign_id, heyreach_campaign_name,
-                         raw_payload, send_at)
+                         raw_payload, send_at, campaign_id)
   VALUES (@first_name, @last_name, @email, @linkedin_url,
           @heyreach_campaign_id, @heyreach_campaign_name,
-          @raw_payload, @send_at)
+          @raw_payload, @send_at, @campaign_id)
 `);
 
 const getDueProspects = db.prepare(`
@@ -89,6 +154,20 @@ function sleep(ms) {
 }
 
 // ---------------------------------------------------------------------------
+// Helper: resolve campaign_id for an email
+// ---------------------------------------------------------------------------
+function resolveCampaignId(email) {
+  if (!campaignRouting) return null;
+  const row = lookupRouting.get(email);
+  if (!row) return null;
+  const campaignId = campaignRouting[row.pain_profile];
+  if (campaignId) {
+    log.info({ email, pain_profile: row.pain_profile, campaignId }, 'Resolved campaign from routing');
+  }
+  return campaignId || null;
+}
+
+// ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
 app.get('/health', (_req, res) => {
@@ -116,6 +195,12 @@ app.post('/webhook/heyreach', (req, res) => {
 
   const sendAt = new Date(Date.now() + DELAY_HOURS * 60 * 60 * 1000).toISOString();
 
+  // Resolve campaign_id from routing table + campaign_routing config
+  const routedCampaignId = resolveCampaignId(prospect.email);
+  const campaignId = routedCampaignId
+    ? Number(routedCampaignId)
+    : (MAILSHAKE_CAMPAIGN_ID ? Number(MAILSHAKE_CAMPAIGN_ID) : null);
+
   try {
     insertProspect.run({
       first_name: prospect.firstName || '',
@@ -126,9 +211,10 @@ app.post('/webhook/heyreach', (req, res) => {
       heyreach_campaign_name: body.campaign?.name || null,
       raw_payload: JSON.stringify(body),
       send_at: sendAt,
+      campaign_id: campaignId,
     });
-    log.info({ email: prospect.email, send_at: sendAt }, 'Prospect stored');
-    return res.json({ accepted: true, send_at: sendAt });
+    log.info({ email: prospect.email, send_at: sendAt, campaign_id: campaignId }, 'Prospect stored');
+    return res.json({ accepted: true, send_at: sendAt, campaign_id: campaignId });
   } catch (err) {
     if (err.message && err.message.includes('UNIQUE constraint failed')) {
       log.info({ email: prospect.email }, 'Duplicate prospect skipped');
@@ -137,6 +223,50 @@ app.post('/webhook/heyreach', (req, res) => {
     log.error({ error: err.message }, 'Failed to store prospect');
     return res.status(500).json({ error: 'Internal error' });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Routing management endpoints
+// ---------------------------------------------------------------------------
+app.post('/routing/load', (req, res) => {
+  const { routes } = req.body;
+  if (!Array.isArray(routes)) {
+    return res.status(400).json({ error: 'Expected { routes: [...] }' });
+  }
+
+  const insertMany = db.transaction((items) => {
+    let inserted = 0;
+    for (const item of items) {
+      if (!item.email || !item.pain_profile) continue;
+      upsertRouting.run({
+        email: item.email,
+        pain_profile: item.pain_profile,
+        first_name: item.first_name || null,
+        last_name: item.last_name || null,
+        company: item.company || null,
+      });
+      inserted++;
+    }
+    return inserted;
+  });
+
+  try {
+    const count = insertMany(routes);
+    log.info({ count }, 'Routing data loaded');
+    return res.json({ loaded: count });
+  } catch (err) {
+    log.error({ error: err.message }, 'Failed to load routing data');
+    return res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+app.get('/routing/stats', (_req, res) => {
+  const rows = routingStats.all();
+  const stats = {};
+  for (const row of rows) {
+    stats[row.pain_profile] = row.count;
+  }
+  res.json(stats);
 });
 
 // ---------------------------------------------------------------------------
@@ -169,10 +299,11 @@ async function pollAddStatus(checkStatusID) {
   return null;
 }
 
-async function addRecipientToMailshake(prospect) {
+async function addRecipientToMailshake(prospect, campaignId) {
+  const effectiveCampaignId = campaignId || Number(MAILSHAKE_CAMPAIGN_ID);
   const url = `${MAILSHAKE_BASE_URL}/recipients/add`;
   const payload = {
-    campaignID: Number(MAILSHAKE_CAMPAIGN_ID),
+    campaignID: effectiveCampaignId,
     addAsNewList: false,
     addresses: [
       {
@@ -187,7 +318,7 @@ async function addRecipientToMailshake(prospect) {
     ],
   };
 
-  log.info({ email: prospect.email, campaignId: MAILSHAKE_CAMPAIGN_ID }, 'Calling Mailshake recipients/add');
+  log.info({ email: prospect.email, campaignId: effectiveCampaignId }, 'Calling Mailshake recipients/add');
 
   const resp = await fetch(url, {
     method: 'POST',
@@ -223,10 +354,13 @@ async function processDueProspects() {
     incrementAttempts.run(prospect.id);
     const currentAttempt = prospect.attempts + 1;
 
+    // Use prospect-specific campaign_id, fall back to default
+    const campaignId = prospect.campaign_id || null;
+
     try {
-      await addRecipientToMailshake(prospect);
+      await addRecipientToMailshake(prospect, campaignId);
       markSent.run(prospect.id);
-      log.info({ id: prospect.id, email: prospect.email }, 'Prospect sent to Mailshake');
+      log.info({ id: prospect.id, email: prospect.email, campaign_id: campaignId }, 'Prospect sent to Mailshake');
     } catch (err) {
       if (currentAttempt >= MAX_ATTEMPTS) {
         markFailed.run(err.message, prospect.id);
@@ -306,6 +440,6 @@ process.on('SIGINT', () => {
 // Start server
 // ---------------------------------------------------------------------------
 app.listen(PORT, async () => {
-  log.info({ port: PORT, delayHours: DELAY_HOURS, dbPath }, 'Sales bridge started');
+  log.info({ port: PORT, delayHours: DELAY_HOURS, dbPath, campaignRouting: !!campaignRouting }, 'Sales bridge started');
   await validateMailshakeConfig();
 });
