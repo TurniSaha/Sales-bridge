@@ -1,0 +1,7 @@
+node_modules
+.env
+prospects.db
+prospects.db-wal
+prospects.db-shm
+.git
+.dockerignore
