@@ -12,7 +12,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const MAILSHAKE_API_KEY = process.env.MAILSHAKE_API_KEY;
 const MAILSHAKE_CAMPAIGN_ID = process.env.MAILSHAKE_CAMPAIGN_ID;
-const DELAY_HOURS = Number(process.env.DELAY_HOURS) || 48;
+const DELAY_HOURS = Number(process.env.DELAY_HOURS) || 72;
 const MAILSHAKE_BASE_URL = 'https://api.mailshake.com/2017-04-01';
 const MAX_ATTEMPTS = 3;
 
