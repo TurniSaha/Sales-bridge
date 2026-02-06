@@ -27,6 +27,8 @@ const MAILSHAKE_AUTH = `Basic ${Buffer.from(MAILSHAKE_API_KEY + ':').toString('b
 // Database setup
 // ---------------------------------------------------------------------------
 const dbPath = process.env.DB_PATH || path.join(__dirname, 'prospects.db');
+const fs = require('fs');
+fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 const db = new Database(dbPath);
 db.pragma('journal_mode = WAL');
 
