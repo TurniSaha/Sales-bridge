@@ -82,6 +82,14 @@ try {
   // Column already exists -- safe to ignore
 }
 
+// Migrate: add company column if it doesn't exist yet
+try {
+  db.exec(`ALTER TABLE prospects ADD COLUMN company TEXT`);
+  log.info('Added company column to prospects table');
+} catch (err) {
+  // Column already exists -- safe to ignore
+}
+
 // ---------------------------------------------------------------------------
 // Routing table (email -> pain_profile for campaign selection)
 // ---------------------------------------------------------------------------
@@ -96,7 +104,7 @@ db.exec(`
 `);
 
 const lookupRouting = db.prepare(`
-  SELECT pain_profile FROM routing WHERE email = ?
+  SELECT pain_profile, company FROM routing WHERE email = ?
 `);
 
 const upsertRouting = db.prepare(`
@@ -119,10 +127,10 @@ const routingStats = db.prepare(`
 const insertProspect = db.prepare(`
   INSERT INTO prospects (first_name, last_name, email, linkedin_url,
                          heyreach_campaign_id, heyreach_campaign_name,
-                         raw_payload, send_at, campaign_id)
+                         raw_payload, send_at, campaign_id, company)
   VALUES (@first_name, @last_name, @email, @linkedin_url,
           @heyreach_campaign_id, @heyreach_campaign_name,
-          @raw_payload, @send_at, @campaign_id)
+          @raw_payload, @send_at, @campaign_id, @company)
 `);
 
 const getDueProspects = db.prepare(`
@@ -156,15 +164,14 @@ function sleep(ms) {
 // ---------------------------------------------------------------------------
 // Helper: resolve campaign_id for an email
 // ---------------------------------------------------------------------------
-function resolveCampaignId(email) {
-  if (!campaignRouting) return null;
+function resolveRouting(email) {
   const row = lookupRouting.get(email);
-  if (!row) return null;
-  const campaignId = campaignRouting[row.pain_profile];
+  if (!row) return { campaignId: null, company: null };
+  const campaignId = campaignRouting ? (campaignRouting[row.pain_profile] || null) : null;
   if (campaignId) {
     log.info({ email, pain_profile: row.pain_profile, campaignId }, 'Resolved campaign from routing');
   }
-  return campaignId || null;
+  return { campaignId, company: row.company || null };
 }
 
 // ---------------------------------------------------------------------------
@@ -195,11 +202,12 @@ app.post('/webhook/heyreach', (req, res) => {
 
   const sendAt = new Date(Date.now() + DELAY_HOURS * 60 * 60 * 1000).toISOString().replace('T', ' ').replace('Z', '');
 
-  // Resolve campaign_id from routing table + campaign_routing config
-  const routedCampaignId = resolveCampaignId(prospect.email);
-  const campaignId = routedCampaignId
-    ? Number(routedCampaignId)
+  // Resolve campaign_id and company from routing table
+  const routing = resolveRouting(prospect.email);
+  const campaignId = routing.campaignId
+    ? Number(routing.campaignId)
     : (MAILSHAKE_CAMPAIGN_ID ? Number(MAILSHAKE_CAMPAIGN_ID) : null);
+  const company = prospect.companyName || prospect.company || routing.company || '';
 
   try {
     insertProspect.run({
@@ -212,9 +220,10 @@ app.post('/webhook/heyreach', (req, res) => {
       raw_payload: JSON.stringify(body),
       send_at: sendAt,
       campaign_id: campaignId,
+      company: company,
     });
-    log.info({ email: prospect.email, send_at: sendAt, campaign_id: campaignId }, 'Prospect stored');
-    return res.json({ accepted: true, send_at: sendAt, campaign_id: campaignId });
+    log.info({ email: prospect.email, send_at: sendAt, campaign_id: campaignId, company }, 'Prospect stored');
+    return res.json({ accepted: true, send_at: sendAt, campaign_id: campaignId, company });
   } catch (err) {
     if (err.message && err.message.includes('UNIQUE constraint failed')) {
       log.info({ email: prospect.email }, 'Duplicate prospect skipped');
@@ -313,6 +322,7 @@ async function addRecipientToMailshake(prospect, campaignId) {
           first: prospect.first_name,
           last: prospect.last_name,
           linkedin: prospect.linkedin_url || '',
+          company: prospect.company || '',
         },
       },
     ],
