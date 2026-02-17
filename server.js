@@ -13,7 +13,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 const MAILSHAKE_API_KEY = process.env.MAILSHAKE_API_KEY;
 const MAILSHAKE_CAMPAIGN_ID = process.env.MAILSHAKE_CAMPAIGN_ID;
-const DELAY_HOURS = Number(process.env.DELAY_HOURS) || 72;
+const DELAY_HOURS = process.env.DELAY_HOURS !== undefined ? Number(process.env.DELAY_HOURS) : 72;
 const MAILSHAKE_BASE_URL = 'https://api.mailshake.com/2017-04-01';
 const MAX_ATTEMPTS = 3;
 
@@ -193,7 +193,7 @@ app.post('/webhook/heyreach', (req, res) => {
     return res.status(400).json({ error: 'Missing prospect email' });
   }
 
-  const sendAt = new Date(Date.now() + DELAY_HOURS * 60 * 60 * 1000).toISOString();
+  const sendAt = new Date(Date.now() + DELAY_HOURS * 60 * 60 * 1000).toISOString().replace('T', ' ').replace('Z', '');
 
   // Resolve campaign_id from routing table + campaign_routing config
   const routedCampaignId = resolveCampaignId(prospect.email);
