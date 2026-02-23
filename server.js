@@ -91,6 +91,49 @@ try {
 }
 
 // ---------------------------------------------------------------------------
+// Leads table (lookup by name/linkedin to resolve email + company)
+// ---------------------------------------------------------------------------
+db.exec(`
+  CREATE TABLE IF NOT EXISTS leads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    first_name TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    company TEXT,
+    linkedin_url TEXT,
+    pain_profile TEXT
+  )
+`);
+
+// Migrate: add unique index on linkedin_url if not present
+try {
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_linkedin ON leads(linkedin_url) WHERE linkedin_url IS NOT NULL AND linkedin_url != ''`);
+} catch (err) { /* safe to ignore */ }
+
+const lookupLeadByLinkedin = db.prepare(`
+  SELECT * FROM leads WHERE linkedin_url = ? LIMIT 1
+`);
+
+const lookupLeadByName = db.prepare(`
+  SELECT * FROM leads WHERE LOWER(first_name) = LOWER(?) AND LOWER(last_name) = LOWER(?) LIMIT 1
+`);
+
+const lookupLeadByFirstName = db.prepare(`
+  SELECT * FROM leads WHERE LOWER(first_name) = LOWER(?) LIMIT 1
+`);
+
+const upsertLead = db.prepare(`
+  INSERT INTO leads (first_name, last_name, email, company, linkedin_url, pain_profile)
+  VALUES (@first_name, @last_name, @email, @company, @linkedin_url, @pain_profile)
+  ON CONFLICT(email) DO UPDATE SET
+    first_name = excluded.first_name,
+    last_name = excluded.last_name,
+    company = excluded.company,
+    linkedin_url = excluded.linkedin_url,
+    pain_profile = excluded.pain_profile
+`);
+
+// ---------------------------------------------------------------------------
 // Routing table (email -> pain_profile for campaign selection)
 // ---------------------------------------------------------------------------
 db.exec(`
@@ -192,29 +235,67 @@ app.get('/status', (_req, res) => {
 
 app.post('/webhook/heyreach', (req, res) => {
   const body = req.body;
-  log.info({ event: body.event, email: body.prospect?.email }, 'Webhook received');
+  log.info({ rawBody: JSON.stringify(body) }, 'Webhook received');
 
-  const prospect = body.prospect;
-  if (!prospect || !prospect.email) {
-    log.warn({ rawBody: JSON.stringify(body) }, 'Missing prospect email in webhook payload');
-    return res.status(400).json({ error: 'Missing prospect email' });
+  // Normalize: extract prospect data from multiple possible payload formats
+  // HeyReach may send: { prospect: { ... } } OR flat fields OR other structures
+  let firstName = body.prospect?.firstName || body.firstName || body.first_name || '';
+  let lastName = body.prospect?.lastName || body.lastName || body.last_name || '';
+  let email = body.prospect?.email || body.email || body.emailAddress || '';
+  let linkedinUrl = body.prospect?.linkedinUrl || body.linkedinUrl || body.linkedin_url || body.linkedInUrl || body.LinkedIn_Profile_URL || '';
+  let companyName = body.prospect?.companyName || body.prospect?.company || body.companyName || body.company || '';
+
+  // If no email, try to resolve from leads table
+  if (!email) {
+    let lead = null;
+
+    // Try LinkedIn URL first (most reliable match)
+    if (linkedinUrl) {
+      // Normalize LinkedIn URL for matching (strip trailing slash)
+      const normalizedUrl = linkedinUrl.replace(/\/$/, '');
+      lead = lookupLeadByLinkedin.get(normalizedUrl) || lookupLeadByLinkedin.get(normalizedUrl + '/') || lookupLeadByLinkedin.get(linkedinUrl);
+    }
+
+    // Fall back to name match
+    if (!lead && firstName && lastName) {
+      lead = lookupLeadByName.get(firstName, lastName);
+    }
+
+    // Fall back to first name only (less reliable but better than dropping)
+    if (!lead && firstName && !lastName) {
+      lead = lookupLeadByFirstName.get(firstName);
+    }
+
+    if (lead) {
+      log.info({ firstName, lastName, linkedinUrl, resolvedEmail: lead.email }, 'Resolved prospect from leads table');
+      email = lead.email;
+      if (!companyName) companyName = lead.company || '';
+      if (!firstName) firstName = lead.first_name || '';
+      if (!lastName) lastName = lead.last_name || '';
+      if (!linkedinUrl) linkedinUrl = lead.linkedin_url || '';
+    }
+  }
+
+  if (!email) {
+    log.warn({ rawBody: JSON.stringify(body), firstName, lastName, linkedinUrl }, 'Could not resolve prospect email');
+    return res.status(400).json({ error: 'Could not resolve prospect email' });
   }
 
   const sendAt = new Date(Date.now() + DELAY_HOURS * 60 * 60 * 1000).toISOString().replace('T', ' ').replace('Z', '');
 
   // Resolve campaign_id and company from routing table
-  const routing = resolveRouting(prospect.email);
+  const routing = resolveRouting(email);
   const campaignId = routing.campaignId
     ? Number(routing.campaignId)
     : (MAILSHAKE_CAMPAIGN_ID ? Number(MAILSHAKE_CAMPAIGN_ID) : null);
-  const company = prospect.companyName || prospect.company || routing.company || '';
+  const company = companyName || routing.company || '';
 
   try {
     insertProspect.run({
-      first_name: prospect.firstName || '',
-      last_name: prospect.lastName || '',
-      email: prospect.email,
-      linkedin_url: prospect.linkedinUrl || null,
+      first_name: firstName,
+      last_name: lastName,
+      email: email,
+      linkedin_url: linkedinUrl || null,
       heyreach_campaign_id: body.campaign?.id || null,
       heyreach_campaign_name: body.campaign?.name || null,
       raw_payload: JSON.stringify(body),
@@ -222,16 +303,57 @@ app.post('/webhook/heyreach', (req, res) => {
       campaign_id: campaignId,
       company: company,
     });
-    log.info({ email: prospect.email, send_at: sendAt, campaign_id: campaignId, company }, 'Prospect stored');
+    log.info({ email, send_at: sendAt, campaign_id: campaignId, company }, 'Prospect stored');
     return res.json({ accepted: true, send_at: sendAt, campaign_id: campaignId, company });
   } catch (err) {
     if (err.message && err.message.includes('UNIQUE constraint failed')) {
-      log.info({ email: prospect.email }, 'Duplicate prospect skipped');
+      log.info({ email }, 'Duplicate prospect skipped');
       return res.json({ accepted: false, reason: 'duplicate' });
     }
     log.error({ error: err.message }, 'Failed to store prospect');
     return res.status(500).json({ error: 'Internal error' });
   }
+});
+
+// ---------------------------------------------------------------------------
+// Leads management endpoints
+// ---------------------------------------------------------------------------
+app.post('/leads/load', (req, res) => {
+  const { leads } = req.body;
+  if (!Array.isArray(leads)) {
+    return res.status(400).json({ error: 'Expected { leads: [...] }' });
+  }
+
+  const insertMany = db.transaction((items) => {
+    let inserted = 0;
+    for (const item of items) {
+      if (!item.email) continue;
+      upsertLead.run({
+        first_name: item.first_name || '',
+        last_name: item.last_name || '',
+        email: item.email,
+        company: item.company || null,
+        linkedin_url: item.linkedin_url || null,
+        pain_profile: item.pain_profile || null,
+      });
+      inserted++;
+    }
+    return inserted;
+  });
+
+  try {
+    const count = insertMany(leads);
+    log.info({ count }, 'Leads loaded');
+    return res.json({ loaded: count });
+  } catch (err) {
+    log.error({ error: err.message }, 'Failed to load leads');
+    return res.status(500).json({ error: 'Internal error' });
+  }
+});
+
+app.get('/leads/count', (_req, res) => {
+  const row = db.prepare('SELECT COUNT(*) as count FROM leads').get();
+  res.json({ count: row.count });
 });
 
 // ---------------------------------------------------------------------------
