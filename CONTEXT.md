@@ -78,10 +78,23 @@ Used for multi-campaign routing. Currently not actively used (single campaign).
 ## Known Issues & Investigation History (2026-02-23)
 
 ### Problem: HeyReach webhooks arrive but fail with "Missing prospect email"
-- **Root cause**: HeyReach sends a payload format that doesn't include `body.prospect.email`. The original server only looked for that one field path.
-- **Fix applied**: Webhook handler now tries multiple field paths AND falls back to the leads lookup table (by LinkedIn URL or name)
-- **Raw payload logging**: Added `JSON.stringify(body)` to all webhook log entries so we can see exactly what HeyReach sends
-- **Status**: We have NOT yet captured a real HeyReach webhook payload with the new logging. The next real event will reveal the exact format.
+- **Root cause**: HeyReach sends data under `body.lead.*` not `body.prospect.*`. Original server only checked `body.prospect.email`.
+- **Fix applied (2026-02-23)**: Updated webhook handler to check `body.lead.email_address`, `body.lead.first_name`, `body.lead.profile_url`, `body.lead.company_name` first. Also falls back to leads table lookup by LinkedIn URL or name.
+- **Confirmed HeyReach payload format** (captured from real webhook):
+  ```
+  body.lead.email_address    — prospect's email
+  body.lead.custom_email     — alternate email field
+  body.lead.first_name       — first name
+  body.lead.last_name        — last name
+  body.lead.full_name        — full name
+  body.lead.profile_url      — LinkedIn URL (no trailing slash)
+  body.lead.company_name     — company (may be null)
+  body.lead.position         — job title (may be null)
+  body.event_type            — e.g. "message_sent"
+  body.campaign.name         — HeyReach campaign name
+  body.campaign.id           — HeyReach campaign ID
+  body.sender.full_name      — sender name
+  ```
 
 ### Problem: Coolify proxy was down ("Proxy Exited")
 - **Impact**: No traffic reached the app at all while proxy was down
