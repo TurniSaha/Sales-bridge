@@ -238,12 +238,12 @@ app.post('/webhook/heyreach', (req, res) => {
   log.info({ rawBody: JSON.stringify(body) }, 'Webhook received');
 
   // Normalize: extract prospect data from multiple possible payload formats
-  // HeyReach may send: { prospect: { ... } } OR flat fields OR other structures
-  let firstName = body.prospect?.firstName || body.firstName || body.first_name || '';
-  let lastName = body.prospect?.lastName || body.lastName || body.last_name || '';
-  let email = body.prospect?.email || body.email || body.emailAddress || '';
-  let linkedinUrl = body.prospect?.linkedinUrl || body.linkedinUrl || body.linkedin_url || body.linkedInUrl || body.LinkedIn_Profile_URL || '';
-  let companyName = body.prospect?.companyName || body.prospect?.company || body.companyName || body.company || '';
+  // HeyReach actual format uses body.lead.* (confirmed 2026-02-23)
+  let firstName = body.lead?.first_name || body.prospect?.firstName || body.firstName || body.first_name || '';
+  let lastName = body.lead?.last_name || body.prospect?.lastName || body.lastName || body.last_name || '';
+  let email = body.lead?.email_address || body.lead?.custom_email || body.lead?.enriched_email || body.prospect?.email || body.email || body.emailAddress || '';
+  let linkedinUrl = body.lead?.profile_url || body.prospect?.linkedinUrl || body.linkedinUrl || body.linkedin_url || '';
+  let companyName = body.lead?.company_name || body.prospect?.companyName || body.prospect?.company || body.companyName || body.company || '';
 
   // If no email, try to resolve from leads table
   if (!email) {
