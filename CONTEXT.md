@@ -191,8 +191,19 @@ curl -X POST "https://api.mailshake.com/2017-04-01/recipients/add" \
   -d '{"campaignID":1499122,"addAsNewList":false,"addresses":[{"emailAddress":"person@example.com","fullName":"First Last","fields":{"first":"First","last":"Last","company":"Company","linkedin":"https://linkedin.com/in/..."}}]}'
 ```
 
+## FIRST THING TO DO NEXT SESSION
+Check if new HeyReach webhooks came through successfully after the payload fix deployed (2026-02-23 ~18:40 UTC):
+```bash
+ssh ubuntu@149.56.102.112
+sudo docker ps --format '{{.Names}}' | grep jkkk
+sudo docker logs <container-name> | grep -i "Prospect stored"
+```
+Also check: `curl http://jkkk04cc4gs4k8okw8kcssss.149.56.102.112.sslip.io/status`
+- If pending/sent counts went up → pipeline is working
+- If still 0 pending and 1 sent → webhooks still failing, check logs for `rawBody` to see what's coming in
+
 ## What Still Needs to Happen
-1. **Capture a real HeyReach webhook payload** — check logs after next real event to confirm the field mapping works
-2. **If field mapping is wrong** — update the normalization block at the top of the webhook handler in `server.js` (around line 214)
+1. **Verify the payload fix works** — check logs for successful "Prospect stored" entries from real HeyReach webhooks (not our manual curl calls)
+2. **If field mapping is still wrong** — update the normalization block at the top of the webhook handler in `server.js` (around line 240)
 3. **Consider adding HTTPS** — currently HTTP only, some webhook providers prefer HTTPS
 4. **Monitor** — check `/status` periodically to confirm pending → sent flow is working
