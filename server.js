@@ -196,7 +196,7 @@ app.post('/webhook/heyreach', (req, res) => {
 
   const prospect = body.prospect;
   if (!prospect || !prospect.email) {
-    log.warn('Missing prospect email in webhook payload');
+    log.warn({ rawBody: JSON.stringify(body) }, 'Missing prospect email in webhook payload');
     return res.status(400).json({ error: 'Missing prospect email' });
   }
 
