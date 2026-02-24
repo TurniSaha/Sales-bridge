@@ -191,19 +191,19 @@ curl -X POST "https://api.mailshake.com/2017-04-01/recipients/add" \
   -d '{"campaignID":1499122,"addAsNewList":false,"addresses":[{"emailAddress":"person@example.com","fullName":"First Last","fields":{"first":"First","last":"Last","company":"Company","linkedin":"https://linkedin.com/in/..."}}]}'
 ```
 
-## FIRST THING TO DO NEXT SESSION
-Check if new HeyReach webhooks came through successfully after the payload fix deployed (2026-02-23 ~18:40 UTC):
-```bash
-ssh ubuntu@149.56.102.112
-sudo docker ps --format '{{.Names}}' | grep jkkk
-sudo docker logs <container-name> | grep -i "Prospect stored"
-```
-Also check: `curl http://jkkk04cc4gs4k8okw8kcssss.149.56.102.112.sslip.io/status`
-- If pending/sent counts went up → pipeline is working
-- If still 0 pending and 1 sent → webhooks still failing, check logs for `rawBody` to see what's coming in
+## Pipeline Verification (2026-02-24)
+- **Pipeline confirmed working**: Real HeyReach webhooks are being received and processed correctly after the payload fix
+- **Status as of 2026-02-24**: 2 pending (Armando, Anjelica), 3 sent, 0 failed
+- **Webhook payloads**: Emails extracted correctly from `body.lead.email_address`
+
+### Prospects currently pending (scheduled for 48hr delay):
+- **Armando GSP** — `armando@solaris-energy.com` — sends 2026-02-26 ~14:43 UTC
+- **Anjelica STS-C** — `anjelicam@ppmechanical.com` — sends 2026-02-26 ~15:35 UTC
+
+### Duplicate prevention fix (2026-02-24)
+Scott Young (`syoung@keeleyconstruction.com`) and Joanie Scaff (`joanie@3binspection.com`) were manually pushed to Mailshake on 2026-02-23, but the webhook also picked them up and created `pending` entries. Manually set their status to `sent` in SQLite to prevent duplicate adds to Mailshake.
 
 ## What Still Needs to Happen
-1. **Verify the payload fix works** — check logs for successful "Prospect stored" entries from real HeyReach webhooks (not our manual curl calls)
-2. **If field mapping is still wrong** — update the normalization block at the top of the webhook handler in `server.js` (around line 240)
-3. **Consider adding HTTPS** — currently HTTP only, some webhook providers prefer HTTPS
-4. **Monitor** — check `/status` periodically to confirm pending → sent flow is working
+1. **Consider adding HTTPS** — currently HTTP only, some webhook providers prefer HTTPS
+2. **Monitor** — check `/status` periodically to confirm pending → sent flow is working
+3. **Duplicate detection** — consider adding logic to check Mailshake before adding, to prevent duplicates automatically
